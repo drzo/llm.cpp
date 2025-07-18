@@ -39,3 +39,4 @@ test_tensor
 *.txt
 /output_prefix_*
 /example/example
+.env
