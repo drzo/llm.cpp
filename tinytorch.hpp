@@ -34,12 +34,14 @@ inline void AssertAligned(T ptr) {
 enum TensorType {
     kF32,
     kI32,
+    kF16,
     kLEN  // number of tensor types
 };
 
 const size_t kTypeSize[kLEN] = {
     sizeof(float),
     sizeof(int32_t),
+    sizeof(uint16_t),  // FP16 stored as uint16_t
 };
 
 template <typename T>
@@ -49,6 +51,8 @@ inline bool IsTypeCompatible(TensorType type) {
             return std::is_same<T, float>::value;
         case kI32:
             return std::is_same<T, int32_t>::value;
+        case kF16:
+            return std::is_same<T, uint16_t>::value;
         default:
             throw std::runtime_error("Malformed tensor type");
     }
@@ -199,6 +203,14 @@ const std::string TENSOR_OP_NAMES[kOpLEN] = { // NOLINT
     "BROADCAST", "VIEW", "TRANSPOSE", "GELU",   "SOFTMAX", "CROSS_ENTROPY",
 };
 
+#ifdef ENABLE_CUDA
+#include "cuda/cuda_backend.hpp"
+#endif
+
+#ifdef ENABLE_AMP
+#include "amp/mixed_precision.hpp"
+#endif
+
 const int kMaxTensorDims = 4;
 const int kMaxTensorOpParams = 2;
 
@@ -234,6 +246,83 @@ class Profile {
 
 class Tensor {
    public:
+    // Device and precision management
+    enum DeviceType {
+        kCPU,
+        kCUDA
+    };
+    
+    DeviceType device_type = kCPU;
+    int device_id = 0;
+    
+    // CUDA support
+    Tensor* cuda() {
+#ifdef ENABLE_CUDA
+        if (device_type == kCUDA) return this;
+        
+        // Allocate GPU memory
+        void* gpu_data = cuda::CudaDevice::get_instance().allocate(
+            NumElements() * kTypeSize[type_]);
+        
+        // Copy data to GPU
+        cuda::CudaDevice::get_instance().copy_to_device(
+            gpu_data, data_, NumElements() * kTypeSize[type_]);
+        
+        // Create new tensor on GPU
+        auto* gpu_tensor = ctx_->NewTensor(Dims(), type_, (std::byte*)gpu_data);
+        gpu_tensor->device_type = kCUDA;
+        gpu_tensor->device_id = cuda::CudaDevice::get_instance().get_device();
+        
+        return gpu_tensor;
+#else
+        throw std::runtime_error("CUDA support not enabled");
+#endif
+    }
+    
+    Tensor* cpu() {
+        if (device_type == kCPU) return this;
+        
+#ifdef ENABLE_CUDA
+        // Allocate CPU memory
+        auto* cpu_tensor = ctx_->NewTensor(Dims(), type_);
+        
+        // Copy data from GPU
+        cuda::CudaDevice::get_instance().copy_to_host(
+            cpu_tensor->data_, data_, NumElements() * kTypeSize[type_]);
+        
+        return cpu_tensor;
+#else
+        return this;
+#endif
+    }
+    
+    // Mixed precision support
+    Tensor* half() {
+        if (type_ == kF16) return this;
+        
+#ifdef ENABLE_AMP
+        amp::AMPConfig config;
+        config.enabled = true;
+        amp::MixedPrecisionManager mp_manager(config);
+        return mp_manager.ensure_fp16(this);
+#else
+        throw std::runtime_error("Mixed precision support not enabled");
+#endif
+    }
+    
+    Tensor* float_() {
+        if (type_ == kF32) return this;
+        
+#ifdef ENABLE_AMP
+        amp::AMPConfig config;
+        config.enabled = true;
+        amp::MixedPrecisionManager mp_manager(config);
+        return mp_manager.ensure_fp32(this);
+#else
+        return this;
+#endif
+    }
+    
     // Add
     Tensor &operator+(Tensor &other) { return operator2(other, kOpAdd); }
 
@@ -777,6 +866,21 @@ class Tensor {
         assert(src0->SameShape(*src1) && src1->SameShape(*dst));
         assert(src0->IsContiguous() && src1->IsContiguous() && dst->IsContiguous());
 
+#ifdef ENABLE_CUDA
+        if (dst->device_type == kCUDA) {
+            if (dst->type_ == kF32) {
+                cuda::kernels::CudaOps::add(
+                    (float*)dst->data_, (float*)src0->data_, (float*)src1->data_,
+                    dst->NumElements());
+            } else if (dst->type_ == kF16) {
+                cuda::kernels::CudaOps::add(
+                    (__half*)dst->data_, (__half*)src0->data_, (__half*)src1->data_,
+                    dst->NumElements());
+            }
+            return;
+        }
+#endif
+        
         size_t n = dst->n_vec();
         for (size_t i = 0; i < n; i++) {
             vec_add(dst->vsize(), (float *)dst->data_ + i * dst->vstride(),
@@ -842,6 +946,25 @@ class Tensor {
         assert(dst->type_ == kF32 && src0->type_ == dst->type_ && src1->type_ == dst->type_);
         assert(src0->IsContiguous() && src1->IsContiguous() && dst->IsContiguous());
 
+#ifdef ENABLE_CUDA
+        if (dst->device_type == kCUDA) {
+            auto [n, m] = dst->mat();
+            int k = src0->dims_[3];
+            int batch_size = dst->n_mat();
+            
+            if (dst->type_ == kF32) {
+                cuda::kernels::CudaOps::matmul(
+                    (float*)dst->data_, (float*)src0->data_, (float*)src1->data_,
+                    n, m, k, batch_size);
+            } else if (dst->type_ == kF16) {
+                cuda::kernels::CudaOps::matmul(
+                    (__half*)dst->data_, (__half*)src0->data_, (__half*)src1->data_,
+                    n, m, k, batch_size);
+            }
+            return;
+        }
+#endif
+        
         size_t n = dst->dims_[2], m = dst->dims_[3], p = src0->dims_[3];
         #pragma omp parallel for collapse(2)
         for (size_t mati = 0; mati < dst->n_mat(); mati++) {
@@ -1186,6 +1309,19 @@ class Tensor {
     static void gelu_forward(Tensor *dst, Tensor *src) {
         assert(dst->SameShape(*src, true, true));
 
+#ifdef ENABLE_CUDA
+        if (dst->device_type == kCUDA) {
+            if (dst->type_ == kF32) {
+                cuda::kernels::CudaOps::gelu(
+                    (float*)dst->data_, (float*)src->data_, dst->NumElements());
+            } else if (dst->type_ == kF16) {
+                cuda::kernels::CudaOps::gelu(
+                    (__half*)dst->data_, (__half*)src->data_, dst->NumElements());
+            }
+            return;
+        }
+#endif
+        
         auto out = (float *)dst->data_;
         auto inp = (float *)src->data_;
         auto N = dst->NumElements();

@@ -10,6 +10,14 @@
 #include "llmc/tokenizer.h"
 #include "tinytorch.hpp"
 
+#ifdef ENABLE_CUDA
+#include "cuda/cuda_backend.hpp"
+#endif
+
+#ifdef ENABLE_AMP
+#include "amp/mixed_precision.hpp"
+#endif
+
 // -------------------------------------------------------------
 // Model Serialization
 
@@ -70,6 +78,14 @@ struct LMHead {
 struct GPT2 {
     GPT2Config config;
     TensorContext *ctx{nullptr};  // tensor memory context for the model
+    
+    // GPU and mixed precision support
+    bool use_cuda = false;
+    bool use_amp = false;
+    
+#ifdef ENABLE_AMP
+    std::unique_ptr<tinytorch::amp::AMPTrainer> amp_trainer;
+#endif
 
     // the wegiths of the model
     struct Embedding embedding;    // the embedding layer
@@ -96,6 +112,29 @@ struct GPT2 {
 };
 
 void gpt2_build_from_checkpoint(GPT2 *model, const std::string &checkpoint_path) {
+    // Check for CUDA availability
+#ifdef ENABLE_CUDA
+    try {
+        auto& cuda_device = tinytorch::cuda::CudaDevice::get_instance();
+        cuda_device.get_device_properties();
+        model->use_cuda = true;
+        std::cout << "CUDA enabled for training" << std::endl;
+    } catch (const std::exception& e) {
+        std::cout << "CUDA not available: " << e.what() << std::endl;
+        model->use_cuda = false;
+    }
+#else
+    model->use_cuda = false;
+#endif
+    
+    // Check for mixed precision support
+#ifdef ENABLE_AMP
+    model->use_amp = true;
+    std::cout << "Mixed precision training enabled" << std::endl;
+#else
+    model->use_amp = false;
+#endif
+    
     FILE *model_file = fopen(checkpoint_path.c_str(), "rb");
     if (model_file == nullptr) {
         throw std::runtime_error("Could not open the model checkpoint file: " + checkpoint_path);
@@ -175,8 +214,27 @@ void gpt2_build_from_checkpoint(GPT2 *model, const std::string &checkpoint_path)
     for (auto t : model->params) {
         model->num_parameters += t->NumElements();
         fread(t->data(), sizeof(float), t->NumElements(), model_file);
+        
+        // Move to GPU if CUDA is enabled
+        if (model->use_cuda) {
+#ifdef ENABLE_CUDA
+            t = t->cuda();
+#endif
+        }
     }
     fclose(model_file);
+    
+    // Initialize mixed precision trainer
+#ifdef ENABLE_AMP
+    if (model->use_amp) {
+        tinytorch::amp::AMPConfig amp_config;
+        amp_config.enabled = true;
+        amp_config.loss_scale = 65536.0f;
+        
+        model->amp_trainer = std::make_unique<tinytorch::amp::AMPTrainer>(
+            model->params, amp_config);
+    }
+#endif
 
     std::cout << "Number of Parameters: " << model->num_parameters << std::endl;
 
@@ -290,12 +348,29 @@ void gpt2_forward(GPT2 *model, const int *inputs, const int *targets, int B, int
 }
 void gpt2_backward(GPT2 *model) {
     float dloss_mean = 1.0f / (model->batch_size * model->seq_len);
+    
+#ifdef ENABLE_AMP
+    if (model->use_amp && model->amp_trainer) {
+        model->amp_trainer->forward_backward(model->losses);
+        return;
+    }
+#endif
+    
     model->losses->Backward(true, dloss_mean);
 }
 
 void gpt2_zero_grad(GPT2 *model) { model->losses->ZeroGrad(); }
 
 void gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, float eps, float weight_decay, int t) {
+#ifdef ENABLE_AMP
+    if (model->use_amp && model->amp_trainer) {
+        if (model->amp_trainer->should_skip_update()) {
+            std::cout << "Skipping optimizer update due to gradient overflow" << std::endl;
+            return;
+        }
+    }
+#endif
+    
     if (model->m_memory.empty()) {
         assert(model->num_parameters > 0);
         model->m_memory = std::vector<float>(model->num_parameters, 0.0f);
