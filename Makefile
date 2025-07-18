@@ -28,10 +28,10 @@ else
 endif
 
 # PHONY means these targets will always be executed
-.PHONY: all train_gpt2 test_gpt2 test_tensor checkpoint_tool
+.PHONY: all train_gpt2 test_gpt2 test_tensor checkpoint_tool model_export_tool distributed_trainer
 
 # default target is all
-all: train_gpt2 test_gpt2 test_tensor checkpoint_tool
+all: train_gpt2 test_gpt2 test_tensor checkpoint_tool model_export_tool distributed_trainer
 
 train_gpt2: train_gpt2.cpp
 	$(CC) $(CFLAGS) $(INCLUDES) $(LDFLAGS) $< $(LDLIBS) -o $@
@@ -45,5 +45,11 @@ test_tensor: test_tensor.cpp
 checkpoint_tool: tools/checkpoint_tool.cpp
 	$(CC) $(CFLAGS) $(INCLUDES) $(LDFLAGS) $< $(LDLIBS) -o $@
 	
+model_export_tool: tools/model_export_tool.cpp
+	$(CC) $(CFLAGS) $(INCLUDES) $(LDFLAGS) $< $(LDLIBS) -o $@
+	
+distributed_trainer: tools/distributed_trainer.cpp
+	$(CC) $(CFLAGS) $(INCLUDES) $(LDFLAGS) $< $(LDLIBS) -lmpi -o $@
+	
 clean:
-	rm -f train_gpt2 test_gpt2 test_tensor checkpoint_tool
+	rm -f train_gpt2 test_gpt2 test_tensor checkpoint_tool model_export_tool distributed_trainer
