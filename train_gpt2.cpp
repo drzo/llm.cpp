@@ -11,6 +11,24 @@
 #include "tinytorch.hpp"
 
 // -------------------------------------------------------------
+// Model Serialization
+
+struct CheckpointMetadata {
+    int magic_number;        // 20241201 for checkpoint format
+    int version;             // checkpoint format version
+    int training_step;       // current training step
+    float learning_rate;     // current learning rate
+    float train_loss;        // last training loss
+    float val_loss;          // last validation loss
+    uint64_t rng_state;      // random number generator state
+    double total_time_ms;    // total training time in milliseconds
+    int batch_size;          // training batch size
+    int seq_len;             // sequence length
+    char dataset_path[256];  // path to training dataset
+    char timestamp[64];      // checkpoint creation timestamp
+};
+
+// -------------------------------------------------------------
 // GPT2
 
 using namespace tinytorch;  // NOLINT
@@ -312,6 +330,180 @@ void gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, flo
 
 void gpt2_free(GPT2 *model) { delete model->ctx; }
 
+void gpt2_save_checkpoint(GPT2 *model, const std::string &checkpoint_path, 
+                         const CheckpointMetadata &metadata) {
+    FILE *checkpoint_file = fopen(checkpoint_path.c_str(), "wb");
+    if (checkpoint_file == nullptr) {
+        throw std::runtime_error("Could not create checkpoint file: " + checkpoint_path);
+    }
+
+    // Write checkpoint metadata
+    fwrite(&metadata, sizeof(CheckpointMetadata), 1, checkpoint_file);
+
+    // Write model configuration
+    int model_header[256] = {0};
+    model_header[0] = 20240326;  // model magic number
+    model_header[1] = 3;         // model version
+    model_header[2] = model->config.max_seq_len;
+    model_header[3] = model->config.vocab_size;
+    model_header[4] = model->config.num_layers;
+    model_header[5] = model->config.num_heads;
+    model_header[6] = model->config.channels;
+    model_header[7] = model->config.padded_vocab_size;
+    fwrite(model_header, sizeof(int), 256, checkpoint_file);
+
+    // Write model parameters
+    for (auto param : model->params) {
+        fwrite(param->data(), sizeof(float), param->NumElements(), checkpoint_file);
+    }
+
+    // Write optimizer state (Adam m and v)
+    if (!model->m_memory.empty()) {
+        fwrite(model->m_memory.data(), sizeof(float), model->m_memory.size(), checkpoint_file);
+        fwrite(model->v_memory.data(), sizeof(float), model->v_memory.size(), checkpoint_file);
+    } else {
+        // Write zeros if optimizer state doesn't exist
+        std::vector<float> zeros(model->num_parameters, 0.0f);
+        fwrite(zeros.data(), sizeof(float), zeros.size(), checkpoint_file);
+        fwrite(zeros.data(), sizeof(float), zeros.size(), checkpoint_file);
+    }
+
+    fclose(checkpoint_file);
+
+    std::cout << "Checkpoint saved to: " << checkpoint_path << std::endl;
+    std::cout << "  Step: " << metadata.training_step << std::endl;
+    std::cout << "  Train Loss: " << metadata.train_loss << std::endl;
+    std::cout << "  Val Loss: " << metadata.val_loss << std::endl;
+}
+
+bool gpt2_load_checkpoint(GPT2 *model, const std::string &checkpoint_path, 
+                         CheckpointMetadata &metadata) {
+    FILE *checkpoint_file = fopen(checkpoint_path.c_str(), "rb");
+    if (checkpoint_file == nullptr) {
+        return false;  // Checkpoint doesn't exist
+    }
+
+    // Read checkpoint metadata
+    size_t read_size = fread(&metadata, sizeof(CheckpointMetadata), 1, checkpoint_file);
+    if (read_size != 1) {
+        fclose(checkpoint_file);
+        throw std::runtime_error("Could not read checkpoint metadata from: " + checkpoint_path);
+    }
+
+    // Validate checkpoint format
+    if (metadata.magic_number != 20241201) {
+        fclose(checkpoint_file);
+        throw std::runtime_error("Invalid checkpoint format in: " + checkpoint_path);
+    }
+
+    // Read model configuration
+    int model_header[256];
+    fread(model_header, sizeof(int), 256, checkpoint_file);
+    if (model_header[0] != 20240326) {
+        fclose(checkpoint_file);
+        throw std::runtime_error("Invalid model format in checkpoint: " + checkpoint_path);
+    }
+
+    // Initialize model if not already done
+    if (model->ctx == nullptr) {
+        model->config.max_seq_len = model_header[2];
+        model->config.vocab_size = model_header[3];
+        model->config.num_layers = model_header[4];
+        model->config.num_heads = model_header[5];
+        model->config.channels = model_header[6];
+        model->config.padded_vocab_size = model_header[7];
+
+        // Initialize model structure (same as gpt2_build_from_checkpoint)
+        int maxT = model->config.max_seq_len;
+        int V = model->config.vocab_size;
+        int Vp = model->config.padded_vocab_size;
+        int L = model->config.num_layers;
+        int NH = model->config.num_heads;
+        int C = model->config.channels;
+
+        TensorContext *ctx;
+        model->ctx = ctx = new TensorContext((size_t)8 * 1024 * 1024 * 1024);
+
+        model->embedding.wte = ctx->NewTensor({Vp, C});
+        model->embedding.wpe = ctx->NewTensor({maxT, C});
+        model->params.insert(model->params.end(), {model->embedding.wte, model->embedding.wpe});
+
+        std::vector<std::vector<Tensor *>> block_params;
+        for (int l = 0; l < L; l++) {
+            auto &blocks = model->blocks;
+            blocks.emplace_back(Block{.ln1w = ctx->NewTensor({C}),
+                                      .ln1b = ctx->NewTensor({C}),
+                                      .qkvw = ctx->NewTensor({3 * C, C}),
+                                      .qkvb = ctx->NewTensor({3 * C}),
+                                      .attprojw = ctx->NewTensor({C, C}),
+                                      .attprojb = ctx->NewTensor({C}),
+                                      .ln2w = ctx->NewTensor({C}),
+                                      .ln2b = ctx->NewTensor({C}),
+                                      .fcw = ctx->NewTensor({4 * C, C}),
+                                      .fcb = ctx->NewTensor({4 * C}),
+                                      .fcprojw = ctx->NewTensor({C, 4 * C}),
+                                      .fcprojb = ctx->NewTensor({C})});
+
+            block_params.push_back({blocks[l].ln1w, blocks[l].ln1b, blocks[l].qkvw, blocks[l].qkvb, 
+                                   blocks[l].attprojw, blocks[l].attprojb, blocks[l].ln2w, blocks[l].ln2b, 
+                                   blocks[l].fcw, blocks[l].fcb, blocks[l].fcprojw, blocks[l].fcprojb});
+        }
+
+        for (int i = 0; i < block_params[0].size(); i++) {
+            for (int l = 0; l < L; l++) {
+                model->params.push_back(block_params[l][i]);
+            }
+        }
+
+        model->lm_head.lnfw = ctx->NewTensor({C});
+        model->lm_head.lnfb = ctx->NewTensor({C});
+        model->params.insert(model->params.end(), {model->lm_head.lnfw, model->lm_head.lnfb});
+
+        model->num_parameters = 0;
+        for (auto t : model->params) {
+            model->num_parameters += t->NumElements();
+        }
+    }
+
+    // Load model parameters
+    for (auto param : model->params) {
+        fread(param->data(), sizeof(float), param->NumElements(), checkpoint_file);
+    }
+
+    // Load optimizer state
+    model->m_memory.resize(model->num_parameters);
+    model->v_memory.resize(model->num_parameters);
+    fread(model->m_memory.data(), sizeof(float), model->m_memory.size(), checkpoint_file);
+    fread(model->v_memory.data(), sizeof(float), model->v_memory.size(), checkpoint_file);
+
+    fclose(checkpoint_file);
+
+    std::cout << "Checkpoint loaded from: " << checkpoint_path << std::endl;
+    std::cout << "  Step: " << metadata.training_step << std::endl;
+    std::cout << "  Train Loss: " << metadata.train_loss << std::endl;
+    std::cout << "  Val Loss: " << metadata.val_loss << std::endl;
+    std::cout << "  Timestamp: " << metadata.timestamp << std::endl;
+
+    return true;
+}
+
+std::string get_checkpoint_path(const std::string &base_dir, int step) {
+    return base_dir + "/checkpoint_step_" + std::to_string(step) + ".bin";
+}
+
+void cleanup_old_checkpoints(const std::string &base_dir, int current_step, int keep_every = 100) {
+    // Keep last 3 checkpoints and every 100th checkpoint
+    for (int step = current_step - 10; step >= 0; step--) {
+        if (step > current_step - 3) continue;  // Keep last 3
+        if (step % keep_every == 0) continue;   // Keep every 100th
+        
+        std::string path = get_checkpoint_path(base_dir, step);
+        if (unlink(path.c_str()) == 0) {
+            std::cout << "Removed old checkpoint: " << path << std::endl;
+        }
+    }
+}
+
 #ifndef TESTING
 
 // -------------------------------------------------------------
@@ -345,9 +537,37 @@ int sample_mult(float *probs, int n, float coin) {
 
 int main() {  // NOLINT
 
-    // build the GPT-2 model from a checkpoint
+    // Configuration
+    const std::string checkpoint_dir = "checkpoints";
+    const std::string resume_from = "";  // Set to checkpoint path to resume training
+    const int save_every = 10;           // Save checkpoint every N steps
+    const int max_steps = 40;
+    
+    // Create checkpoint directory
+    system(("mkdir -p " + checkpoint_dir).c_str());
+
+    // Build the GPT-2 model
     GPT2 model;
-    gpt2_build_from_checkpoint(&model, "gpt2_124M.bin");
+    CheckpointMetadata metadata = {0};
+    int start_step = 0;
+    double total_time_ms = 0.0;
+    uint64_t rng_state = 1337;
+    
+    if (!resume_from.empty()) {
+        // Resume from checkpoint
+        if (gpt2_load_checkpoint(&model, resume_from, metadata)) {
+            start_step = metadata.training_step + 1;
+            total_time_ms = metadata.total_time_ms;
+            rng_state = metadata.rng_state;
+            std::cout << "Resuming training from step " << start_step << std::endl;
+        } else {
+            std::cout << "Could not load checkpoint, starting from scratch" << std::endl;
+            gpt2_build_from_checkpoint(&model, "gpt2_124M.bin");
+        }
+    } else {
+        // Start from pre-trained model
+        gpt2_build_from_checkpoint(&model, "gpt2_124M.bin");
+    }
 
     // build the training set and validation set data loaders
     const std::string tiny_shakespeare_train = "dev/data/tinyshakespeare/tiny_shakespeare_train.bin";
@@ -368,16 +588,15 @@ int main() {  // NOLINT
     tokenizer_init(&tokenizer, "gpt2_tokenizer.bin");
 
     // some memory for generating samples from the model
-    uint64_t rng_state = 1337;
     const int gen_max_length = 64;
     int gen_tokens[B * T];
 
     // train the model
     struct timespec start, end;
-    for (int step = 0; step <= 40; step++) {
+    for (int step = start_step; step <= max_steps; step++) {
         // once in a while, estimate the validation loss
+        float val_loss = 0.0f;
         if (step % 10 == 0) {
-            float val_loss = 0.0f;
             dataloader_reset(&val_loader);
             for (int i = 0; i < val_num_batches; i++) {
                 dataloader_next_batch(&val_loader);
@@ -424,6 +643,34 @@ int main() {  // NOLINT
         double time_elapsed_s = (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9;
         std::cout << "step " << step << " train Loss: " << model.mean_loss << " (took " << time_elapsed_s * 1000
                   << " ms)" << std::endl;
+
+        // Update total time
+        total_time_ms += time_elapsed_s * 1000;
+
+        // Save checkpoint
+        if (step % save_every == 0 || step == max_steps) {
+            // Get current timestamp
+            auto now = std::time(nullptr);
+            auto tm = *std::localtime(&now);
+            
+            metadata = {
+                .magic_number = 20241201,
+                .version = 1,
+                .training_step = step,
+                .learning_rate = 1e-4f,
+                .train_loss = model.mean_loss,
+                .val_loss = val_loss,
+                .rng_state = rng_state,
+                .total_time_ms = total_time_ms,
+                .batch_size = (int)B,
+                .seq_len = (int)T
+            };
+            strftime(metadata.timestamp, sizeof(metadata.timestamp), "%Y-%m-%d %H:%M:%S", &tm);
+            strcpy(metadata.dataset_path, train_token.c_str());
+            
+            gpt2_save_checkpoint(&model, get_checkpoint_path(checkpoint_dir, step), metadata);
+            cleanup_old_checkpoints(checkpoint_dir, step);
+        }
     }
 
     tokenizer_free(&tokenizer);

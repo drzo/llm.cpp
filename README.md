@@ -45,6 +45,23 @@ Number of Parameters: 124475904
 step 0 train Loss: 4.67778 (took 7666.71 ms)
 step 1 train Loss: 5.19158 (took 7368.44 ms)
 ...
+Checkpoint saved to: checkpoints/checkpoint_step_10.bin
+  Step: 10
+  Train Loss: 3.24567
+  Val Loss: 3.45123
+```
+
+### Resume Training from Checkpoint
+
+```bash
+# List available checkpoints
+./checkpoint_tool list ./checkpoints
+
+# Get checkpoint info
+./checkpoint_tool info ./checkpoints/checkpoint_step_100.bin
+
+# Resume training (modify resume_from in main() or use checkpoint_tool)
+OMP_NUM_THREADS=8 ./train_gpt2
 ```
 
 ### Running tinytorch Example
@@ -64,6 +81,7 @@ tinytorch is a lightweight, single-header tensor library that provides:
 - **Neural Network Layers**: Fully connected, attention, layer normalization
 - **Activation Functions**: GELU, Softmax, etc.
 - **Memory Management**: Efficient tensor context with custom allocator
+- **Model Serialization**: Save and load model checkpoints with optimizer state
 
 ### Basic Usage
 
@@ -100,6 +118,9 @@ llm.cpp/
 ├── train_gpt2.cpp         # GPT-2 training implementation
 ├── test_gpt2.cpp          # GPT-2 testing and validation
 ├── test_tensor.cpp        # tinytorch unit tests
+├── checkpoint_manager.hpp  # Checkpoint management utilities
+├── tools/
+│   └── checkpoint_tool.cpp # Checkpoint inspection and management tool
 ├── example/
 │   ├── tinytorch_example.cpp  # Complete neural network example
 │   └── Makefile
@@ -114,6 +135,45 @@ llm.cpp/
 └── boost/
     └── ut.hpp            # Unit testing framework
 ```
+
+## 💾 Model Serialization
+
+The project includes a comprehensive checkpoint system:
+
+### Checkpoint Features
+
+- **Complete State**: Saves model weights, optimizer state, and training metadata
+- **Resume Training**: Seamlessly continue training from any checkpoint
+- **Automatic Cleanup**: Keeps recent checkpoints and periodic snapshots
+- **Metadata Tracking**: Loss curves, training time, configuration details
+
+### Checkpoint Management
+
+```bash
+# Build the checkpoint tool
+make checkpoint_tool
+
+# List all checkpoints
+./checkpoint_tool list ./checkpoints
+
+# Get detailed info about a checkpoint
+./checkpoint_tool info ./checkpoints/checkpoint_step_100.bin
+
+# Convert checkpoint to deployment model
+./checkpoint_tool convert ./checkpoints/checkpoint_step_100.bin model.bin
+
+# Clean up old checkpoints
+./checkpoint_tool cleanup ./checkpoints
+```
+
+### Checkpoint Format
+
+Each checkpoint contains:
+- **Model weights**: All parameter tensors
+- **Optimizer state**: Adam momentum and velocity
+- **Training metadata**: Step, loss, learning rate, timestamp
+- **Model configuration**: Architecture parameters
+- **RNG state**: For reproducible training
 
 ## 🧪 Testing
 
